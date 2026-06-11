@@ -15,6 +15,30 @@ type Item struct {
 	Notes string `json:"notes,omitempty"`
 }
 
+// Attack is a structured weapon/attack entry. To-hit derives from the
+// ability modifier + proficiency (+ magic bonus); damage from the dice +
+// ability modifier (+ magic bonus). MagicBonus models a +1 weapon (applies
+// to both rolls).
+type Attack struct {
+	Name       string `json:"name"`
+	Ability    string `json:"ability,omitempty"` // canonical key; "" = str
+	Proficient bool   `json:"proficient"`
+	MagicBonus int    `json:"magic_bonus,omitempty"`
+	Damage     string `json:"damage"` // dice, e.g. "1d8"
+	DamageType string `json:"damage_type,omitempty"`
+	Range      string `json:"range,omitempty"`
+	Notes      string `json:"notes,omitempty"`
+}
+
+// Spell is one known/prepared spell. Level 0 = cantrip (no slot).
+type Spell struct {
+	Name     string `json:"name"`
+	Level    int    `json:"level"`
+	Key      string `json:"key,omitempty"` // Open5e key for dnd_ref_get
+	Prepared bool   `json:"prepared,omitempty"`
+	Notes    string `json:"notes,omitempty"`
+}
+
 // Character is a full sheet. JSON-typed columns are unmarshalled on read.
 // The flat shape is deliberate — close enough to common character-JSON
 // exports that a D&D Beyond import could map onto it later.
@@ -40,6 +64,9 @@ type Character struct {
 	Speed      int            `json:"speed"`
 	Inventory  []Item         `json:"inventory"`
 	SpellSlots map[string]int `json:"spell_slots"`
+	Attacks    []Attack       `json:"attacks"`
+	Spells     []Spell        `json:"spells"`
+	Conditions []string       `json:"conditions"`
 	Features   []string       `json:"features"`
 	Notes      string         `json:"notes"`
 	CreatedAt  string         `json:"created_at"`
@@ -48,17 +75,19 @@ type Character struct {
 
 const charCols = `c.id, c.campaign_id, ca.name, c.name, c.player, c.kind, c.species, c.class,
 	c.background, c.alignment, c.level, c.xp, c.abilities, c.skills, c.saves,
-	c.hp_max, c.hp_current, c.ac, c.speed, c.inventory, c.spell_slots, c.features, c.notes,
+	c.hp_max, c.hp_current, c.ac, c.speed, c.inventory, c.spell_slots,
+	c.attacks, c.spells, c.conditions, c.features, c.notes,
 	c.created_at, c.updated_at`
 
 const charFrom = ` FROM characters c JOIN campaigns ca ON ca.id = c.campaign_id `
 
 func scanCharacter(row interface{ Scan(...any) error }) (Character, error) {
 	var c Character
-	var abilities, skills, saves, inventory, slots, features string
+	var abilities, skills, saves, inventory, slots, attacks, spells, conditions, features string
 	err := row.Scan(&c.ID, &c.CampaignID, &c.Campaign, &c.Name, &c.Player, &c.Kind, &c.Species, &c.Class,
 		&c.Background, &c.Alignment, &c.Level, &c.XP, &abilities, &skills, &saves,
-		&c.HPMax, &c.HPCurrent, &c.AC, &c.Speed, &inventory, &slots, &features, &c.Notes,
+		&c.HPMax, &c.HPCurrent, &c.AC, &c.Speed, &inventory, &slots,
+		&attacks, &spells, &conditions, &features, &c.Notes,
 		&c.CreatedAt, &c.UpdatedAt)
 	if err != nil {
 		return c, err
@@ -70,7 +99,9 @@ func scanCharacter(row interface{ Scan(...any) error }) (Character, error) {
 		dst any
 	}{
 		{abilities, &c.Abilities}, {skills, &c.Skills}, {saves, &c.Saves},
-		{inventory, &c.Inventory}, {slots, &c.SpellSlots}, {features, &c.Features},
+		{inventory, &c.Inventory}, {slots, &c.SpellSlots},
+		{attacks, &c.Attacks}, {spells, &c.Spells}, {conditions, &c.Conditions},
+		{features, &c.Features},
 	} {
 		if err := json.Unmarshal([]byte(dec.raw), dec.dst); err != nil {
 			return c, fmt.Errorf("character %s: corrupt column json: %w", c.Name, err)
@@ -100,12 +131,15 @@ func (s *Store) CreateCharacter(c Character) (Character, error) {
 	}
 	res, err := s.DB.Exec(`INSERT INTO characters
 		(campaign_id, name, player, kind, species, class, background, alignment, level, xp,
-		 abilities, skills, saves, hp_max, hp_current, ac, speed, inventory, spell_slots, features, notes)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 abilities, skills, saves, hp_max, hp_current, ac, speed, inventory, spell_slots,
+		 attacks, spells, conditions, features, notes)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		c.CampaignID, c.Name, c.Player, c.Kind, c.Species, c.Class, c.Background, c.Alignment, c.Level, c.XP,
 		mustJSON(c.Abilities), mustJSON(emptyToList(c.Skills)), mustJSON(emptyToList(c.Saves)),
 		c.HPMax, c.HPCurrent, c.AC, c.Speed,
-		mustJSON(emptyToItems(c.Inventory)), mustJSON(c.SpellSlots), mustJSON(emptyToList(c.Features)), c.Notes)
+		mustJSON(emptyToItems(c.Inventory)), mustJSON(c.SpellSlots),
+		mustJSON(emptyToAttacks(c.Attacks)), mustJSON(emptyToSpells(c.Spells)), mustJSON(emptyToList(c.Conditions)),
+		mustJSON(emptyToList(c.Features)), c.Notes)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			return Character{}, fmt.Errorf("a character named %q already exists in this campaign", c.Name)
@@ -126,6 +160,20 @@ func emptyToList(v []string) []string {
 func emptyToItems(v []Item) []Item {
 	if v == nil {
 		return []Item{}
+	}
+	return v
+}
+
+func emptyToAttacks(v []Attack) []Attack {
+	if v == nil {
+		return []Attack{}
+	}
+	return v
+}
+
+func emptyToSpells(v []Spell) []Spell {
+	if v == nil {
+		return []Spell{}
 	}
 	return v
 }
@@ -209,15 +257,46 @@ func (s *Store) SaveCharacter(c Character) (Character, error) {
 	_, err := s.DB.Exec(`UPDATE characters SET
 		player=?, kind=?, species=?, class=?, background=?, alignment=?, level=?, xp=?,
 		abilities=?, skills=?, saves=?, hp_max=?, hp_current=?, ac=?, speed=?,
-		inventory=?, spell_slots=?, features=?, notes=?, updated_at=datetime('now')
+		inventory=?, spell_slots=?, attacks=?, spells=?, conditions=?, features=?, notes=?,
+		updated_at=datetime('now')
 		WHERE id=?`,
 		c.Player, c.Kind, c.Species, c.Class, c.Background, c.Alignment, c.Level, c.XP,
 		mustJSON(c.Abilities), mustJSON(emptyToList(c.Skills)), mustJSON(emptyToList(c.Saves)),
 		c.HPMax, c.HPCurrent, c.AC, c.Speed,
-		mustJSON(emptyToItems(c.Inventory)), mustJSON(c.SpellSlots), mustJSON(emptyToList(c.Features)), c.Notes,
+		mustJSON(emptyToItems(c.Inventory)), mustJSON(c.SpellSlots),
+		mustJSON(emptyToAttacks(c.Attacks)), mustJSON(emptyToSpells(c.Spells)), mustJSON(emptyToList(c.Conditions)),
+		mustJSON(emptyToList(c.Features)), c.Notes,
 		c.ID)
 	if err != nil {
 		return Character{}, err
 	}
 	return s.CharacterByID(c.ID)
+}
+
+// FindCharacterByPlayer resolves the character a PLAYER runs in a campaign —
+// the binding /check, /attack, and the /char panel use (player = the chat
+// display name). Falls back to a character NAMED like the player.
+func (s *Store) FindCharacterByPlayer(player string, campaignID int64) (Character, error) {
+	rows, err := s.DB.Query(`SELECT `+charCols+charFrom+
+		`WHERE c.campaign_id = ? AND (c.player = ? COLLATE NOCASE OR c.name = ?) ORDER BY c.player = ? COLLATE NOCASE DESC`,
+		campaignID, player, player, player)
+	if err != nil {
+		return Character{}, err
+	}
+	defer rows.Close()
+	var found []Character
+	for rows.Next() {
+		c, err := scanCharacter(rows)
+		if err != nil {
+			return Character{}, err
+		}
+		found = append(found, c)
+	}
+	if err := rows.Err(); err != nil {
+		return Character{}, err
+	}
+	if len(found) == 0 {
+		return Character{}, fmt.Errorf("no character bound to player %q in this campaign — set the sheet's player field (or name a character after them)", player)
+	}
+	return found[0], nil
 }

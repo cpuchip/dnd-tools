@@ -6,13 +6,15 @@ import (
 	"fmt"
 )
 
-// Campaign is a campaign record.
+// Campaign is a campaign record. RoomID binds it to a chat room so room-side
+// slash commands resolve which campaign they act in.
 type Campaign struct {
 	ID          int64  `json:"id"`
 	Name        string `json:"name"`
 	Description string `json:"description"`
 	Setting     string `json:"setting"`
 	Status      string `json:"status"`
+	RoomID      string `json:"room_id"`
 	CreatedAt   string `json:"created_at"`
 	UpdatedAt   string `json:"updated_at"`
 }
@@ -30,11 +32,11 @@ type LogEntry struct {
 // ErrNotFound marks a missing campaign/character.
 var ErrNotFound = errors.New("not found")
 
-const campaignCols = `id, name, description, setting, status, created_at, updated_at`
+const campaignCols = `id, name, description, setting, status, room_id, created_at, updated_at`
 
 func scanCampaign(row interface{ Scan(...any) error }) (Campaign, error) {
 	var c Campaign
-	err := row.Scan(&c.ID, &c.Name, &c.Description, &c.Setting, &c.Status, &c.CreatedAt, &c.UpdatedAt)
+	err := row.Scan(&c.ID, &c.Name, &c.Description, &c.Setting, &c.Status, &c.RoomID, &c.CreatedAt, &c.UpdatedAt)
 	return c, err
 }
 
@@ -121,6 +123,27 @@ func (s *Store) ResolveCampaign(name string) (Campaign, error) {
 func (s *Store) SetCampaignStatus(id int64, status string) error {
 	_, err := s.DB.Exec(`UPDATE campaigns SET status = ?, updated_at = datetime('now') WHERE id = ?`, status, id)
 	return err
+}
+
+// BindRoom points a chat room at a campaign (one campaign per room: any
+// previous campaign bound to the room is unbound first).
+func (s *Store) BindRoom(campaignID int64, roomID string) error {
+	if roomID != "" {
+		if _, err := s.DB.Exec(`UPDATE campaigns SET room_id = '' WHERE room_id = ?`, roomID); err != nil {
+			return err
+		}
+	}
+	_, err := s.DB.Exec(`UPDATE campaigns SET room_id = ?, updated_at = datetime('now') WHERE id = ?`, roomID, campaignID)
+	return err
+}
+
+// CampaignByRoom resolves the campaign a chat room is bound to.
+func (s *Store) CampaignByRoom(roomID string) (Campaign, error) {
+	c, err := scanCampaign(s.DB.QueryRow(`SELECT `+campaignCols+` FROM campaigns WHERE room_id = ?`, roomID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Campaign{}, fmt.Errorf("no campaign is bound to this room — bind one with dnd_campaign_bind: %w", ErrNotFound)
+	}
+	return c, err
 }
 
 // AppendLog appends a session entry; session_no auto-increments per campaign.

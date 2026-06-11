@@ -276,3 +276,24 @@ func ResolveCheck(check string, abilities map[string]int, profSkills, profSaves 
 func (c Check) RollSuggestion(characterName string) string {
 	return fmt.Sprintf("/roll 1d20%s [%s — %s]", FmtMod(c.Mod), characterName, c.Label)
 }
+
+// AttackMods computes a weapon attack's to-hit and damage modifiers:
+// to-hit = ability mod + proficiency (if proficient) + magic bonus;
+// damage modifier = ability mod + magic bonus.
+func AttackMods(abilityScore, level, magicBonus int, proficient bool) (toHit, damageMod int) {
+	mod := AbilityMod(abilityScore)
+	toHit = mod + magicBonus
+	if proficient {
+		toHit += ProficiencyBonus(level)
+	}
+	return toHit, mod + magicBonus
+}
+
+// DamageExpr appends a modifier to a dice expression: ("1d8", 3) -> "1d8+3";
+// a zero modifier leaves the dice alone.
+func DamageExpr(dice string, mod int) string {
+	if mod == 0 {
+		return dice
+	}
+	return dice + FmtMod(mod)
+}

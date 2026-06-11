@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,6 +41,12 @@ func New(st *store.Store, ref *open5e.Client, version string) *Server {
 
 // Serve runs stdio MCP (blocks).
 func (s *Server) Serve() error { return server.ServeStdio(s.mcp) }
+
+// HTTPHandler returns the MCP server as a streamable-HTTP handler (mounted
+// at /mcp) so a remote bridge can dial it like exa-search.
+func (s *Server) HTTPHandler() http.Handler {
+	return server.NewStreamableHTTPServer(s.mcp, server.WithEndpointPath("/mcp"))
+}
 
 func (s *Server) register() {
 	// --- campaigns -----------------------------------------------------
@@ -117,6 +124,12 @@ func (s *Server) register() {
 			mcp.WithString("spell_slots", mcp.Description(`Set spell slots: JSON {"1":4,"2":2} or CSV "1:4,2:2"`)),
 			mcp.WithString("skills_add", mcp.Description("Comma-separated skills to add as proficiencies")),
 			mcp.WithString("features_add", mcp.Description("Comma-separated features/traits to add")),
+			mcp.WithString("attacks_add", mcp.Description(`Add a weapon/attack: "Name: dice [type] [ability] [+N magic] [noprof] [range X]" — e.g. "Longsword: 1d8 slashing", "Dagger: 1d4 piercing dex range 20/60", "Flame Tongue: 2d6 fire +1". Or a JSON Attack object.`)),
+			mcp.WithString("attacks_remove", mcp.Description("Remove an attack by name")),
+			mcp.WithString("spells_add", mcp.Description(`Comma-separated spells as "Name@level" (level 0/omitted = cantrip): "Fire Bolt@0, Fireball@3"`)),
+			mcp.WithString("spells_remove", mcp.Description("Remove a spell by name")),
+			mcp.WithString("conditions_add", mcp.Description("Comma-separated conditions to apply, e.g. \"poisoned, prone\"")),
+			mcp.WithString("conditions_remove", mcp.Description("Comma-separated conditions to clear")),
 		), s.handleCharUpdate)
 
 	s.mcp.AddTool(
@@ -127,12 +140,78 @@ func (s *Server) register() {
 		), s.handleCharLevelup)
 
 	s.mcp.AddTool(
+		mcp.NewTool("dnd_char_attack",
+			mcp.WithDescription("Resolve a weapon attack: the to-hit roll to post, and the damage roll to post IF the DM rules it a hit. NEVER invent the results — post the suggested /roll commands and let the room roll in the open."),
+			mcp.WithString("name", mcp.Required(), mcp.Description("Attacker's character name")),
+			mcp.WithString("weapon", mcp.Description("Which attack on the sheet (default: the first one)")),
+			mcp.WithString("target", mcp.Description("Flavor target for the roll comment, e.g. \"the goblin\"")),
+			mcp.WithString("campaign", mcp.Description("Campaign name (optional if the character name is unique)")),
+		), s.handleCharAttack)
+
+	s.mcp.AddTool(
+		mcp.NewTool("dnd_char_cast",
+			mcp.WithDescription("Cast a spell from the character's sheet: verifies it's known, spends the spell slot (cantrips are free), and reports remaining slots. If the spell has a damage roll, the suggested /roll is included — post it, never invent results."),
+			mcp.WithString("name", mcp.Required(), mcp.Description("Caster's character name")),
+			mcp.WithString("spell", mcp.Required(), mcp.Description("Spell name from the sheet")),
+			mcp.WithNumber("slot_level", mcp.Description("Upcast: spend a higher-level slot (default: the spell's level)")),
+			mcp.WithString("campaign", mcp.Description("Campaign name (optional if the character name is unique)")),
+		), s.handleCharCast)
+
+	s.mcp.AddTool(
 		mcp.NewTool("dnd_char_check",
 			mcp.WithDescription("Resolve a d20 check for a character: the total modifier, its breakdown, and the exact /roll command to post so the ROOM rolls it in the open. NEVER invent a die result — post the suggested /roll instead."),
 			mcp.WithString("name", mcp.Required(), mcp.Description("Character name")),
 			mcp.WithString("check", mcp.Required(), mcp.Description(`A skill ("perception"), ability ("str"), save ("dex save"), or "initiative"`)),
 			mcp.WithString("campaign", mcp.Description("Campaign name (optional if the character name is unique)")),
 		), s.handleCharCheck)
+
+	// --- world building ---------------------------------------------------
+	s.mcp.AddTool(
+		mcp.NewTool("dnd_campaign_bind",
+			mcp.WithDescription("Bind a campaign to a chat room (one campaign per room). Room-side commands like /attack and /check use this to know which campaign the room plays."),
+			mcp.WithString("room_id", mcp.Required(), mcp.Description("The chat room/channel id")),
+			mcp.WithString("campaign", mcp.Description("Campaign name (optional if unambiguous)")),
+		), s.handleCampaignBind)
+
+	s.mcp.AddTool(
+		mcp.NewTool("dnd_lore_set",
+			mcp.WithDescription("Create or update a piece of campaign lore: a location, NPC, faction, plot thread, item, or event. The world's durable memory — write what the table establishes, update as it evolves."),
+			mcp.WithString("name", mcp.Required(), mcp.Description("Entry name, unique within the campaign")),
+			mcp.WithString("body", mcp.Required(), mcp.Description("The lore text")),
+			mcp.WithString("kind", mcp.Description("location | npc | faction | plot | item | event | other (default other)")),
+			mcp.WithBoolean("dm_secret", mcp.Description("DM-only entry — hidden from players' surfaces (default false)")),
+			mcp.WithString("campaign", mcp.Description("Campaign name (optional if unambiguous)")),
+		), s.handleLoreSet)
+
+	s.mcp.AddTool(
+		mcp.NewTool("dnd_lore_get",
+			mcp.WithDescription("Fetch one lore entry by name."),
+			mcp.WithString("name", mcp.Required(), mcp.Description("Entry name")),
+			mcp.WithString("campaign", mcp.Description("Campaign name (optional if unambiguous)")),
+		), s.handleLoreGet)
+
+	s.mcp.AddTool(
+		mcp.NewTool("dnd_lore_list",
+			mcp.WithDescription("List the campaign's lore entries (names + kinds), optionally by kind."),
+			mcp.WithString("kind", mcp.Description("Filter: location | npc | faction | plot | item | event | other")),
+			mcp.WithBoolean("include_secrets", mcp.Description("Include DM-only entries (DM use; default false)")),
+			mcp.WithString("campaign", mcp.Description("Campaign name (optional if unambiguous)")),
+		), s.handleLoreList)
+
+	s.mcp.AddTool(
+		mcp.NewTool("dnd_lore_search",
+			mcp.WithDescription("Search the campaign's lore by name/body text."),
+			mcp.WithString("query", mcp.Required(), mcp.Description("Search text")),
+			mcp.WithBoolean("include_secrets", mcp.Description("Include DM-only entries (DM use; default false)")),
+			mcp.WithString("campaign", mcp.Description("Campaign name (optional if unambiguous)")),
+		), s.handleLoreSearch)
+
+	s.mcp.AddTool(
+		mcp.NewTool("dnd_lore_delete",
+			mcp.WithDescription("Delete a lore entry by name."),
+			mcp.WithString("name", mcp.Required(), mcp.Description("Entry name")),
+			mcp.WithString("campaign", mcp.Description("Campaign name (optional if unambiguous)")),
+		), s.handleLoreDelete)
 
 	// --- reference (Open5e) ---------------------------------------------
 	s.mcp.AddTool(
@@ -604,6 +683,91 @@ func (s *Server) handleCharUpdate(_ context.Context, req mcp.CallToolRequest) (*
 		for _, f := range splitCSV(spec) {
 			c.Features = append(c.Features, f)
 			changes = append(changes, "feature +"+f)
+		}
+	}
+	if spec := strArg(req, "attacks_add"); spec != "" {
+		a, err := parseAttack(spec)
+		if err != nil {
+			return errText(err), nil
+		}
+		replaced := false
+		for i := range c.Attacks {
+			if strings.EqualFold(c.Attacks[i].Name, a.Name) {
+				c.Attacks[i] = a
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			c.Attacks = append(c.Attacks, a)
+		}
+		changes = append(changes, "attack +"+a.Name)
+	}
+	if name := strArg(req, "attacks_remove"); name != "" {
+		removed := false
+		for i := range c.Attacks {
+			if strings.EqualFold(c.Attacks[i].Name, name) {
+				c.Attacks = append(c.Attacks[:i], c.Attacks[i+1:]...)
+				removed = true
+				break
+			}
+		}
+		if !removed {
+			return mcp.NewToolResultError(fmt.Sprintf("%s has no attack named %q", c.Name, name)), nil
+		}
+		changes = append(changes, "attack -"+name)
+	}
+	if spec := strArg(req, "spells_add"); spec != "" {
+		add, err := parseSpells(spec)
+		if err != nil {
+			return errText(err), nil
+		}
+		for _, sp := range add {
+			dup := false
+			for i := range c.Spells {
+				if strings.EqualFold(c.Spells[i].Name, sp.Name) {
+					c.Spells[i] = sp
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				c.Spells = append(c.Spells, sp)
+			}
+			changes = append(changes, "spell +"+sp.Name)
+		}
+	}
+	if name := strArg(req, "spells_remove"); name != "" {
+		removed := false
+		for i := range c.Spells {
+			if strings.EqualFold(c.Spells[i].Name, name) {
+				c.Spells = append(c.Spells[:i], c.Spells[i+1:]...)
+				removed = true
+				break
+			}
+		}
+		if !removed {
+			return mcp.NewToolResultError(fmt.Sprintf("%s knows no spell named %q", c.Name, name)), nil
+		}
+		changes = append(changes, "spell -"+name)
+	}
+	if spec := strArg(req, "conditions_add"); spec != "" {
+		for _, cond := range splitCSV(spec) {
+			if !containsFold(c.Conditions, cond) {
+				c.Conditions = append(c.Conditions, strings.ToLower(cond))
+				changes = append(changes, "condition +"+cond)
+			}
+		}
+	}
+	if spec := strArg(req, "conditions_remove"); spec != "" {
+		for _, cond := range splitCSV(spec) {
+			for i := range c.Conditions {
+				if strings.EqualFold(c.Conditions[i], cond) {
+					c.Conditions = append(c.Conditions[:i], c.Conditions[i+1:]...)
+					changes = append(changes, "condition -"+cond)
+					break
+				}
+			}
 		}
 	}
 

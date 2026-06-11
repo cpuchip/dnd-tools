@@ -43,8 +43,34 @@ func Open(path string) (*Store, error) {
 func (s *Store) Close() error { return s.DB.Close() }
 
 func (s *Store) migrate() error {
-	_, err := s.DB.Exec(schema)
-	return err
+	if _, err := s.DB.Exec(schema); err != nil {
+		return err
+	}
+	return s.ensureColumns()
+}
+
+// ensureColumns adds v0.2+ columns to databases created by older binaries.
+// SQLite has no IF NOT EXISTS for ADD COLUMN, so presence is checked first.
+func (s *Store) ensureColumns() error {
+	adds := []struct{ table, column, ddl string }{
+		{"characters", "attacks", `ALTER TABLE characters ADD COLUMN attacks TEXT NOT NULL DEFAULT '[]'`},
+		{"characters", "spells", `ALTER TABLE characters ADD COLUMN spells TEXT NOT NULL DEFAULT '[]'`},
+		{"characters", "conditions", `ALTER TABLE characters ADD COLUMN conditions TEXT NOT NULL DEFAULT '[]'`},
+		{"campaigns", "room_id", `ALTER TABLE campaigns ADD COLUMN room_id TEXT NOT NULL DEFAULT ''`},
+	}
+	for _, a := range adds {
+		var n int
+		err := s.DB.QueryRow(`SELECT count(*) FROM pragma_table_info(?) WHERE name = ?`, a.table, a.column).Scan(&n)
+		if err != nil {
+			return fmt.Errorf("inspect %s.%s: %w", a.table, a.column, err)
+		}
+		if n == 0 {
+			if _, err := s.DB.Exec(a.ddl); err != nil {
+				return fmt.Errorf("add %s.%s: %w", a.table, a.column, err)
+			}
+		}
+	}
+	return nil
 }
 
 const schema = `
@@ -100,6 +126,18 @@ CREATE TABLE IF NOT EXISTS ref_cache (
   cache_key  TEXT PRIMARY KEY,
   body       TEXT NOT NULL,
   fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS lore (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  campaign_id INTEGER NOT NULL REFERENCES campaigns(id),
+  kind        TEXT NOT NULL DEFAULT 'other' CHECK (kind IN ('location','npc','faction','plot','item','event','other')),
+  name        TEXT NOT NULL COLLATE NOCASE,
+  body        TEXT NOT NULL DEFAULT '',
+  dm_secret   INTEGER NOT NULL DEFAULT 0,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (campaign_id, name)
 );
 `
 

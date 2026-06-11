@@ -10,6 +10,105 @@ import (
 	"github.com/cpuchip/dnd-tools/internal/store"
 )
 
+// AttackResult is a resolved weapon attack: what to roll to hit and, on a
+// hit, what to roll for damage. Both rolls are SUGGESTIONS for the room's
+// server — dnd-tools never rolls.
+type AttackResult struct {
+	Weapon     string `json:"weapon"`
+	ToHit      int    `json:"to_hit"`
+	DamageExpr string `json:"damage_expr"`
+	DamageType string `json:"damage_type,omitempty"`
+	Breakdown  string `json:"breakdown"`
+	ToHitRoll  string `json:"to_hit_roll"`
+	DamageRoll string `json:"damage_roll"`
+}
+
+// ResolveAttack computes an attack's numbers for a character. target is
+// flavor for the roll comments ("" = generic).
+func ResolveAttack(c store.Character, a store.Attack, target string) AttackResult {
+	ability := a.Ability
+	if ability == "" {
+		ability = "str"
+	}
+	toHit, dmgMod := rules.AttackMods(c.Abilities[ability], c.Level, a.MagicBonus, a.Proficient)
+	breakdown := fmt.Sprintf("%s %s", strings.ToUpper(ability), rules.FmtMod(rules.AbilityMod(c.Abilities[ability])))
+	if a.Proficient {
+		breakdown += fmt.Sprintf(", proficiency %s", rules.FmtMod(rules.ProficiencyBonus(c.Level)))
+	}
+	if a.MagicBonus != 0 {
+		breakdown += fmt.Sprintf(", magic %s", rules.FmtMod(a.MagicBonus))
+	}
+	vs := ""
+	if target != "" {
+		vs = " vs " + target
+	}
+	dmgExpr := rules.DamageExpr(a.Damage, dmgMod)
+	dmgLabel := a.Name + " damage"
+	if a.DamageType != "" {
+		dmgLabel += " (" + a.DamageType + ")"
+	}
+	return AttackResult{
+		Weapon:     a.Name,
+		ToHit:      toHit,
+		DamageExpr: dmgExpr,
+		DamageType: a.DamageType,
+		Breakdown:  breakdown,
+		ToHitRoll:  fmt.Sprintf("/roll 1d20%s [%s — %s%s]", rules.FmtMod(toHit), c.Name, a.Name, vs),
+		DamageRoll: fmt.Sprintf("/roll %s [%s — %s]", dmgExpr, c.Name, dmgLabel),
+	}
+}
+
+// FindAttack picks a character's attack by name (case-insensitive,
+// prefix-tolerant). Empty name returns the first attack.
+func FindAttack(c store.Character, name string) (store.Attack, error) {
+	if len(c.Attacks) == 0 {
+		return store.Attack{}, fmt.Errorf("%s has no attacks on the sheet — add one with dnd_char_update attacks_add", c.Name)
+	}
+	if strings.TrimSpace(name) == "" {
+		return c.Attacks[0], nil
+	}
+	n := strings.ToLower(strings.TrimSpace(name))
+	for _, a := range c.Attacks {
+		if strings.ToLower(a.Name) == n {
+			return a, nil
+		}
+	}
+	for _, a := range c.Attacks {
+		if strings.HasPrefix(strings.ToLower(a.Name), n) {
+			return a, nil
+		}
+	}
+	var names []string
+	for _, a := range c.Attacks {
+		names = append(names, a.Name)
+	}
+	return store.Attack{}, fmt.Errorf("%s has no attack named %q (has: %s)", c.Name, name, strings.Join(names, ", "))
+}
+
+// FindSpell picks a character's known spell by name (case-insensitive,
+// prefix-tolerant).
+func FindSpell(c store.Character, name string) (store.Spell, error) {
+	n := strings.ToLower(strings.TrimSpace(name))
+	for _, sp := range c.Spells {
+		if strings.ToLower(sp.Name) == n {
+			return sp, nil
+		}
+	}
+	for _, sp := range c.Spells {
+		if strings.HasPrefix(strings.ToLower(sp.Name), n) {
+			return sp, nil
+		}
+	}
+	var names []string
+	for _, sp := range c.Spells {
+		names = append(names, sp.Name)
+	}
+	if len(names) == 0 {
+		return store.Spell{}, fmt.Errorf("%s knows no spells — add them with dnd_char_update spells_add", c.Name)
+	}
+	return store.Spell{}, fmt.Errorf("%s doesn't know %q (knows: %s)", c.Name, name, strings.Join(names, ", "))
+}
+
 // titleCase upper-cases the first letter only — class names are plain ASCII
 // ("fighter" → "Fighter"); known classes arrive pre-cased from rules.
 func titleCase(s string) string {
@@ -80,6 +179,42 @@ func Render(c store.Character) string {
 			ss = append(ss, fmt.Sprintf("%s %s", rules.SkillName(k), rules.FmtMod(rules.AbilityMod(c.Abilities[ab])+prof)))
 		}
 		fmt.Fprintf(&b, "**Skills:** %s\n", strings.Join(ss, ", "))
+	}
+
+	if len(c.Conditions) > 0 {
+		fmt.Fprintf(&b, "**Conditions:** %s\n", strings.Join(c.Conditions, ", "))
+	}
+
+	if len(c.Attacks) > 0 {
+		b.WriteString("\n**Attacks:**\n")
+		for _, a := range c.Attacks {
+			r := ResolveAttack(c, a, "")
+			line := fmt.Sprintf("- %s: %s to hit, %s", a.Name, rules.FmtMod(r.ToHit), r.DamageExpr)
+			if a.DamageType != "" {
+				line += " " + a.DamageType
+			}
+			if a.Range != "" {
+				line += fmt.Sprintf(" (range %s)", a.Range)
+			}
+			b.WriteString(line + "\n")
+		}
+	}
+
+	if len(c.Spells) > 0 {
+		var byLevel []string
+		for _, sp := range c.Spells {
+			tag := sp.Name
+			if sp.Level > 0 {
+				tag += fmt.Sprintf(" (L%d)", sp.Level)
+			} else {
+				tag += " (cantrip)"
+			}
+			if sp.Prepared {
+				tag += "*"
+			}
+			byLevel = append(byLevel, tag)
+		}
+		fmt.Fprintf(&b, "**Spells:** %s\n", strings.Join(byLevel, ", "))
 	}
 
 	if len(c.SpellSlots) > 0 {
