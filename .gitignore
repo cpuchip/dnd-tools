@@ -1,6 +1,7 @@
-# binaries
+# binaries (root-anchored — cmd/dnd-mcp/ is a SOURCE directory; an unanchored
+# "dnd-mcp" once ignored it and the repo shipped without its main package)
 *.exe
-dnd-mcp
+/dnd-mcp
 
 # runtime state (the SQLite DB lives wherever DND_DB points; never in git)
 *.db
