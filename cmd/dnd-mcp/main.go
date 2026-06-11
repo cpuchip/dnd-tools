@@ -25,7 +25,7 @@ import (
 	"github.com/cpuchip/dnd-tools/internal/store"
 )
 
-const version = "0.2.0"
+const version = "0.2.1"
 
 func main() {
 	dbPath := flag.String("db", envOr("DND_DB", "dnd.db"), "SQLite database path (env DND_DB)")
