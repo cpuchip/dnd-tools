@@ -56,6 +56,68 @@ func Handler(st *store.Store, ref *open5e.Client, version, apiKey string) http.H
 		writeJSON(w, http.StatusOK, cs)
 	})
 
+	mux.HandleFunc("POST /api/campaigns", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+			Setting     string `json:"setting"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Name) == "" {
+			badReq(w, `body must be {"name":"...", "description":..., "setting":...}`)
+			return
+		}
+		c, err := st.CreateCampaign(strings.TrimSpace(body.Name), body.Description, body.Setting)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, c)
+	})
+
+	// PUT /api/rooms/{roomID}/campaign {"campaign":"name"} binds (creating the
+	// campaign if needed); {"campaign":""} unbinds. The room's binding IS the
+	// D&D feature switch (DH-4 room gating).
+	mux.HandleFunc("PUT /api/rooms/{roomID}/campaign", func(w http.ResponseWriter, r *http.Request) {
+		roomID := r.PathValue("roomID")
+		var body struct {
+			Campaign string `json:"campaign"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			badReq(w, `body must be {"campaign":"<name>"} (empty name unbinds)`)
+			return
+		}
+		name := strings.TrimSpace(body.Campaign)
+		if name == "" {
+			c, err := st.CampaignByRoom(roomID)
+			if err != nil {
+				writeErr(w, err)
+				return
+			}
+			if err := st.BindRoom(c.ID, ""); err != nil {
+				writeErr(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"unbound": c.Name})
+			return
+		}
+		c, err := st.CampaignByName(name)
+		if errors.Is(err, store.ErrNotFound) {
+			if c, err = st.CreateCampaign(name, "", ""); err != nil {
+				writeErr(w, err)
+				return
+			}
+		} else if err != nil {
+			writeErr(w, err)
+			return
+		}
+		if err := st.BindRoom(c.ID, roomID); err != nil {
+			writeErr(w, err)
+			return
+		}
+		c, _ = st.CampaignByID(c.ID)
+		writeJSON(w, http.StatusOK, c)
+	})
+
 	mux.HandleFunc("GET /api/campaigns/{name}", func(w http.ResponseWriter, r *http.Request) {
 		c, err := st.CampaignByName(r.PathValue("name"))
 		if err != nil {
