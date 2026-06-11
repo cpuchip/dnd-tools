@@ -1,0 +1,9 @@
+# binaries
+*.exe
+dnd-mcp
+
+# runtime state (the SQLite DB lives wherever DND_DB points; never in git)
+*.db
+*.db-shm
+*.db-wal
+.data/
